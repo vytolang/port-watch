@@ -1,0 +1,182 @@
+// Turning attributed sockets into something a person reads.
+//
+// Two rules shape this file:
+//
+//   1. Columns are sized to the data, not fixed. A table padded for an IPv6
+//      address when nothing is listening on IPv6 wastes half the terminal.
+//
+//   2. An unattributed socket NEVER renders as a blank owner. A blank reads
+//      as "nothing holds this port", which is never true and sends people
+//      hunting for a process that is right there. It renders as "?" with a
+//      footer saying why.
+
+import { Sock, protoName } from "port-watch/src/procnet";
+import { Unresolved } from "port-watch/src/attribute";
+
+fn maxLen(a: int, s: string): int { if (s.len > a) { return s.len; } return a; }
+
+// Sort by port, then proto, then pid: the order someone scanning for a port
+// number expects. Insertion sort — a machine with more than a few hundred
+// listening sockets does not exist outside a load balancer.
+export fn sortSocks(xs: Sock[]) {
+    let i = 1;
+    while (i < xs.len) {
+        let v = xs[i];
+        let j = i - 1;
+        while (j >= 0 && greater(xs[j], v)) {
+            xs[j + 1] = xs[j];
+            j -= 1;
+        }
+        xs[j + 1] = v;
+        i += 1;
+    }
+}
+
+fn greater(a: Sock, b: Sock): bool {
+    if (a.port != b.port)   { return a.port > b.port; }
+    if (a.proto != b.proto) { return a.proto > b.proto; }
+    return a.pid > b.pid;
+}
+
+export fn table(socks: Sock[], un: Unresolved, showUser: bool): string {
+    if (socks.len == 0) {
+        return "no listening sockets";
+    }
+
+    let wPort = 4;      // "PORT"
+    let wProto = 5;     // "PROTO"
+    let wPid = 3;       // "PID"
+    let wUser = 4;      // "USER"
+    let wAddr = 7;      // "ADDRESS"
+
+    let i = 0;
+    while (i < socks.len) {
+        let s = socks[i];
+        i += 1;
+        wPort = maxLen(wPort, `{s.port}`);
+        wProto = maxLen(wProto, protoName(s.proto));
+        wPid = maxLen(wPid, pidLabel(s));
+        wUser = maxLen(wUser, s.user);
+        wAddr = maxLen(wAddr, s.addrLabel());
+    }
+
+    let out: string[] = [];
+    let head = "PORT".pad_start(wPort, " ") + "  " +
+               "PROTO".pad_end(wProto, " ") + "  " +
+               "PID".pad_start(wPid, " ") + "  ";
+    if (showUser) { head += "USER".pad_end(wUser, " ") + "  "; }
+    head += "ADDRESS".pad_end(wAddr, " ") + "  COMMAND";
+    out.push(head);
+
+    i = 0;
+    while (i < socks.len) {
+        let s = socks[i];
+        i += 1;
+        let row = `{s.port}`.pad_start(wPort, " ") + "  " +
+                  protoName(s.proto).pad_end(wProto, " ") + "  " +
+                  pidLabel(s).pad_start(wPid, " ") + "  ";
+        if (showUser) { row += s.user.pad_end(wUser, " ") + "  "; }
+        row += s.addrLabel().pad_end(wAddr, " ") + "  " + cmdLabel(s);
+        out.push(row);
+    }
+
+    if (un.any()) {
+        out.push("");
+        if (un.denied > 0) {
+            let plural = "sockets";
+            if (un.denied == 1) { plural = "socket"; }
+            out.push(`{un.denied} {plural} owned by another user — run with sudo to resolve`);
+        }
+        if (un.vanished > 0) {
+            let plural = "sockets";
+            if (un.vanished == 1) { plural = "socket"; }
+            out.push(`{un.vanished} {plural} with no owning process (closing, or held by the kernel)`);
+        }
+    }
+    return out.join("\n");
+}
+
+fn pidLabel(s: Sock): string {
+    if (s.pid < 0) { return "?"; }
+    return `{s.pid}`;
+}
+
+// Never blank. An empty COMMAND cell reads as "nothing is holding this port",
+// which is never what an unattributed socket means — the holder exists, we
+// were just not allowed to look at it. The footer says which case it is.
+fn cmdLabel(s: Sock): string {
+    let base = "?";
+    if (!s.cmd.is_empty()) { base = s.cmd; }
+    // A socket shared by several processes is the pre-fork case, and it is
+    // what makes `-k` refuse. Showing the count here means that refusal is
+    // never a surprise.
+    if (s.pids.len > 1) {
+        return base + ` (+{s.pids.len - 1} more)`;
+    }
+    return base;
+}
+
+// ---- json ---------------------------------------------------------------
+
+// Ordinary runs are copied with slice(), not character by character:
+// indexing a string yields the BYTE, and a byte's to_string() is its decimal
+// value ("65"), not the character. Slicing also means an escape-free string
+// — which is nearly all of them — costs one copy rather than one allocation
+// per character.
+fn esc(s: string): string {
+    let out = "";
+    let run = 0;
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        let rep = "";
+        if (c == 34)      { rep = "\\\""; }
+        else if (c == 92) { rep = "\\\\"; }
+        else if (c == 10) { rep = "\\n"; }
+        else if (c == 13) { rep = "\\r"; }
+        else if (c == 9)  { rep = "\\t"; }
+        else if (c < 32)  { rep = " "; }
+
+        if (rep.is_empty()) {
+            i += 1;
+        } else {
+            if (i > run) { out += s.slice(run, i); }
+            out += rep;
+            i += 1;
+            run = i;
+        }
+    }
+    if (s.len > run) { out += s.slice(run, s.len); }
+    return out;
+}
+
+// Assembled by joining lines rather than embedding "\n", because a BACKTICK
+// TEMPLATE DOES NOT PROCESS ESCAPES in Vyto — `\n` inside one is a literal
+// backslash followed by an 'n', which would emit unparseable JSON. The
+// newline comes from join() and from the line list, where it is real.
+export fn json(socks: Sock[], un: Unresolved): string {
+    let rows: string[] = [];
+    let i = 0;
+    while (i < socks.len) {
+        let s = socks[i];
+        i += 1;
+        let pid = `{s.pid}`;
+        if (s.pid < 0) { pid = "null"; }
+        let comma = ",";
+        if (i == socks.len) { comma = ""; }
+        rows.push(`    {"{"}"port": {s.port}, "proto": "{protoName(s.proto)}", ` +
+                  `"address": "{esc(s.addr)}", "state": "{s.stateName()}", ` +
+                  `"pid": {pid}, "user": "{esc(s.user)}", ` +
+                  `"command": "{esc(cmdLabel(s))}", "inode": {s.inode}{"}"}{comma}`);
+    }
+
+    let out: string[] = [];
+    out.push("{");
+    out.push("  \"sockets\": [");
+    let r = 0;
+    while (r < rows.len) { out.push(rows[r]); r += 1; }
+    out.push("  ],");
+    out.push(`  "unresolved": {"{"}"denied": {un.denied}, "vanished": {un.vanished}{"}"}`);
+    out.push("}");
+    return out.join("\n");
+}

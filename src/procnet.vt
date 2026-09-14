@@ -1,0 +1,343 @@
+// Parsing /proc/net/{tcp,tcp6,udp,udp6} into socket records.
+//
+// The kernel's format is fixed-width-ish text, one socket per line after a
+// header. Only four columns matter here:
+//
+//     sl  local_address rem_address   st ... uid ... inode
+//      0: 0100007F:1538 00000000:0000 0A ... 131 ... 11220
+//
+// `local_address` is hex, and the address half is LITTLE-ENDIAN per 4-byte
+// group while the port half is big-endian. 0100007F:1538 is 127.0.0.1:5432,
+// not 1.0.0.127:5432. Getting this backwards produces plausible-looking
+// garbage rather than an error, which is why it has its own test.
+//
+// `inode` is the join key to a process: /proc/<pid>/fd/<n> is a symlink
+// reading "socket:[<inode>]". Nothing else connects a port to a pid.
+
+import { Sysproc } from "port-watch/src/sysproc";
+
+// TCP states, as the kernel's st column. Only LISTEN is load-bearing —
+// everything else is shown but never acted on.
+export const ST_ESTABLISHED: int = 1;
+export const ST_LISTEN:      int = 10;
+
+export const PROTO_TCP:  int = 0;
+export const PROTO_TCP6: int = 1;
+export const PROTO_UDP:  int = 2;
+export const PROTO_UDP6: int = 3;
+
+export fn protoName(p: int): string {
+    if (p == PROTO_TCP)  { return "tcp"; }
+    if (p == PROTO_TCP6) { return "tcp6"; }
+    if (p == PROTO_UDP)  { return "udp"; }
+    return "udp6";
+}
+
+// A listening socket, before it has been attributed to a process.
+export class Sock {
+    proto: int;
+    addr: string;            // presentation form, e.g. "127.0.0.1" or "::"
+    port: int;
+    state: int;
+    uid: int;
+    inode: int;
+
+    // Filled in later by the fd scan; -1 means "no owner found", which is
+    // reported as unresolvable rather than as absence.
+    pid: int;
+    cmd: string;
+    user: string;
+
+    // EVERY process holding this socket, not just the first.
+    //
+    // A listening socket is ONE inode that can be shared by many processes:
+    // a pre-forking server binds once and forks, and each child inherits the
+    // same descriptor. Recording only the first holder makes `-k` kill one
+    // worker, report the port free, and leave it held by the siblings — the
+    // exact false success this tool exists to avoid.
+    pids: int[];
+    cmds: string[];
+
+    fn init() {
+        this.proto = 0;
+        this.addr = "";
+        this.port = 0;
+        this.state = 0;
+        this.uid = 0;
+        this.inode = 0;
+        this.pid = -1;
+        this.cmd = "";
+        this.user = "";
+        this.pids = [];
+        this.cmds = [];
+    }
+
+    fn stateName(): string {
+        if (this.state == ST_LISTEN)      { return "LISTEN"; }
+        if (this.state == ST_ESTABLISHED) { return "ESTAB"; }
+        return "-";
+    }
+
+    // How the address should read in a table. The kernel writes the
+    // all-interfaces address as 0.0.0.0 / ::, and "*" is what every other
+    // tool shows, so it is what users scan for.
+    fn addrLabel(): string {
+        if (this.addr == "0.0.0.0" || this.addr == "::") { return "*"; }
+        return this.addr;
+    }
+}
+
+// ---- hex ----------------------------------------------------------------
+
+// One hex digit, or -1. Not using to_int: it aborts the process on bad input
+// (see vyto/cli's README on the same trap), and /proc can hand us a truncated
+// line if we read it mid-write.
+fn hexDigit(c: int): int {
+    if (c >= 48 && c <= 57)  { return c - 48; }        // '0'-'9'
+    if (c >= 97 && c <= 102) { return c - 87; }        // 'a'-'f'
+    if (c >= 65 && c <= 70)  { return c - 55; }        // 'A'-'F'
+    return -1;
+}
+
+// Parse `n` hex digits starting at `i`. Returns -1 on any non-digit, so a
+// short or corrupt field is dropped rather than read as a partial number.
+fn hexAt(s: string, i: int, n: int): int {
+    if (i + n > s.len) { return -1; }
+    let v = 0;
+    let k = 0;
+    while (k < n) {
+        let d = hexDigit(s[i + k]);
+        if (d < 0) { return -1; }
+        v = v * 16 + d;
+        k += 1;
+    }
+    return v;
+}
+
+// "0100007F" -> "127.0.0.1".
+//
+// The kernel writes the address as a native-endian __be32 rendered with %08X,
+// so on a little-endian host the bytes come out reversed: byte 0 of the text
+// is the LAST octet of the address.
+fn ipv4FromHex(h: string): string {
+    if (h.len != 8) { return ""; }
+    let b0 = hexAt(h, 0, 2);
+    let b1 = hexAt(h, 2, 2);
+    let b2 = hexAt(h, 4, 2);
+    let b3 = hexAt(h, 6, 2);
+    if (b0 < 0 || b1 < 0 || b2 < 0 || b3 < 0) { return ""; }
+    return `{b3}.{b2}.{b1}.{b0}`;
+}
+
+// 32 hex chars -> an IPv6 presentation string.
+//
+// Same per-4-byte-group reversal as v4, applied to each of the four groups.
+// The result is compressed with the standard "longest run of zero groups"
+// rule, because an uncompressed v6 address is 39 columns and would set the
+// table width on its own.
+fn ipv6FromHex(h: string): string {
+    if (h.len != 32) { return ""; }
+
+    let groups: int[] = [];
+    let g = 0;
+    while (g < 4) {
+        // Reverse the 4 bytes of this group, then split into two 16-bit halves.
+        let base = g * 8;
+        let b0 = hexAt(h, base + 0, 2);
+        let b1 = hexAt(h, base + 2, 2);
+        let b2 = hexAt(h, base + 4, 2);
+        let b3 = hexAt(h, base + 6, 2);
+        if (b0 < 0 || b1 < 0 || b2 < 0 || b3 < 0) { return ""; }
+        groups.push(b3 * 256 + b2);
+        groups.push(b1 * 256 + b0);
+        g += 1;
+    }
+
+    // An IPv4-mapped address (::ffff:a.b.c.d) is how a v4 socket shows up in
+    // the tcp6 table on a dual-stack listener. Rendering it as v6 hides that
+    // it is reachable over v4, which is usually the thing being checked.
+    if (groups[0] == 0 && groups[1] == 0 && groups[2] == 0 &&
+        groups[3] == 0 && groups[4] == 0 && groups[5] == 0xffff) {
+        let hi = groups[6];
+        let lo = groups[7];
+        let a = hi / 256;
+        let b = hi % 256;
+        let c = lo / 256;
+        let d = lo % 256;
+        return `::ffff:{a}.{b}.{c}.{d}`;
+    }
+
+    // Longest zero run, for "::" compression. Ties go to the leftmost run,
+    // which is what RFC 5952 requires.
+    let bestStart = -1;
+    let bestLen = 0;
+    let i = 0;
+    while (i < 8) {
+        if (groups[i] == 0) {
+            let j = i;
+            while (j < 8 && groups[j] == 0) { j += 1; }
+            let runLen = j - i;
+            if (runLen > bestLen) { bestLen = runLen; bestStart = i; }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    // A single zero group is written as "0", not compressed — "::" for one
+    // group is legal but unconventional and reads as a mistake.
+    if (bestLen < 2) { bestStart = -1; }
+
+    let parts: string[] = [];
+    i = 0;
+    while (i < 8) {
+        if (i == bestStart) {
+            parts.push("");
+            if (bestStart == 0) { parts.push(""); }
+            i += bestLen;
+            if (i >= 8) { parts.push(""); }
+        } else {
+            parts.push(hexLower(groups[i]));
+            i += 1;
+        }
+    }
+    return parts.join(":");
+}
+
+// Indexing a string gives the byte, whose to_string() is its decimal value,
+// so the digit is sliced out of the table rather than converted.
+fn hexLower(v: int): string {
+    if (v == 0) { return "0"; }
+    let digits = "0123456789abcdef";
+    let out = "";
+    let n = v;
+    while (n > 0) {
+        let d = n % 16;
+        out = digits.slice(d, d + 1) + out;
+        n = n / 16;
+    }
+    return out;
+}
+
+// ---- line parsing -------------------------------------------------------
+
+// Split on runs of whitespace. The kernel pads columns to align them, so a
+// plain split on " " yields a pile of empty fields.
+//
+// Built with slice() rather than by accumulating characters: indexing a
+// string yields the BYTE, and `byte.to_string()` renders its decimal value
+// ("48"), not the character — so a char-by-char build produces digit soup
+// that parses as a plausible-looking wrong number. Slicing sidesteps the
+// conversion entirely and allocates one string per field instead of one per
+// character.
+fn fields(line: string): string[] {
+    let out: string[] = [];
+    let i = 0;
+    while (i < line.len) {
+        while (i < line.len && (line[i] == 32 || line[i] == 9)) { i += 1; }
+        if (i >= line.len) { break; }
+        let start = i;
+        while (i < line.len && line[i] != 32 && line[i] != 9) { i += 1; }
+        out.push(line.slice(start, i));
+    }
+    return out;
+}
+
+// Decimal parse that returns -1 instead of aborting. Same reason as hexAt.
+fn decOf(s: string): int {
+    if (s.is_empty()) { return -1; }
+    let v = 0;
+    let i = 0;
+    while (i < s.len) {
+        let d = s[i] - 48;
+        if (d < 0 || d > 9) { return -1; }
+        v = v * 10 + d;
+        i += 1;
+    }
+    return v;
+}
+
+// One line of /proc/net/*, or null if it is the header or unparseable.
+//
+// Unparseable is not an error worth reporting: /proc is read without locking,
+// so a line can be torn. Dropping it and moving on is correct, and the socket
+// will be there on the next refresh.
+fn parseLine(line: string, proto: int): Sock? {
+    let f = fields(line);
+    if (f.len < 10) { return null; }
+
+    let local = f[1];
+    let colon = local.index_of(":");
+    if (colon <= 0) { return null; }
+
+    let hexAddr = local.slice(0, colon);
+    let hexPort = local.slice(colon + 1, local.len);
+
+    let port = hexAt(hexPort, 0, hexPort.len);
+    if (port < 0 || port > 65535) { return null; }
+
+    let addr = "";
+    if (proto == PROTO_TCP || proto == PROTO_UDP) {
+        addr = ipv4FromHex(hexAddr);
+    } else {
+        addr = ipv6FromHex(hexAddr);
+    }
+    if (addr.is_empty()) { return null; }
+
+    let st = hexAt(f[3], 0, f[3].len);
+    if (st < 0) { return null; }
+
+    let uid = decOf(f[7]);
+    let inode = decOf(f[9]);
+    if (inode <= 0) { return null; }
+
+    let s = new Sock();
+    s.proto = proto;
+    s.addr = addr;
+    s.port = port;
+    s.state = st;
+    s.uid = uid;
+    s.inode = inode;
+    return s;
+}
+
+// ---- the public read ----------------------------------------------------
+
+// Every listening socket on the machine.
+//
+// UDP has no LISTEN state — a bound UDP socket sits in state 7 (CLOSE) — so
+// "listening" means `st == LISTEN` for TCP and "bound to a port" for UDP.
+// Excluding UDP entirely would hide DNS resolvers and every game server;
+// including its connected sockets would bury the table.
+export fn listening(sp: Sysproc, wantUdp: bool): Sock[] {
+    let out: Sock[] = [];
+
+    readInto(sp, "/proc/net/tcp",  PROTO_TCP,  true,  out);
+    readInto(sp, "/proc/net/tcp6", PROTO_TCP6, true,  out);
+    if (wantUdp) {
+        readInto(sp, "/proc/net/udp",  PROTO_UDP,  false, out);
+        readInto(sp, "/proc/net/udp6", PROTO_UDP6, false, out);
+    }
+    return out;
+}
+
+fn readInto(sp: Sysproc, path: string, proto: int, tcp: bool, out: Sock[]) {
+    // Absent on a kernel built without IPv6, which is not an error.
+    let text = sp.readFile(path, 1 << 20);
+    if (text.is_empty()) { return; }
+
+    let lines = text.split("\n");
+    let i = 1;                          // [0] is the column header
+    while (i < lines.len) {
+        let s = parseLine(lines[i], proto);
+        if (s != null) {
+            let keep = false;
+            if (tcp) {
+                keep = s.state == ST_LISTEN;
+            } else {
+                keep = s.port > 0;
+            }
+            if (keep) { out.push(s); }
+        }
+        i += 1;
+    }
+}

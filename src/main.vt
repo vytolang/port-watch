@@ -1,0 +1,312 @@
+// port-watch — what is holding this port, and kill it.
+//
+//     port-watch                 every listening socket
+//     port-watch 3000            just that port
+//     port-watch -k 3000         terminate whatever holds it
+//     port-watch -w              live, redraws on change
+//
+// The design follows domain-to-port: the headline form is one line with no
+// subcommand, and every path ends by telling the user what is actually true
+// now rather than reporting bare success.
+
+import { cli, Cli } from "vyto/cli";
+import { exit } from "vyto/os";
+import { sysproc, Sysproc } from "port-watch/src/sysproc";
+import { Sock, listening, ST_LISTEN } from "port-watch/src/procnet";
+import { attribute, Unresolved } from "port-watch/src/attribute";
+import { table, json, sortSocks } from "port-watch/src/render";
+
+export const VERSION: string = "0.1.0";
+
+extern "C" {
+    fn kill(pid: i32, sig: i32): i32;
+    fn usleep(us: culong): i32;
+    fn pw_alive(pid: i32): i32;
+    fn pw_flush();
+}
+
+const SIG_NONE: int = 0;
+const SIGTERM:  int = 15;
+const SIGKILL:  int = 9;
+
+fn main() {
+    let app = new Cli("port-watch", "what is holding this port, and kill it");
+    app.flag("kill", "terminate the process holding PORT (SIGTERM)").short("k");
+    app.flag("force", "with --kill, use SIGKILL instead of SIGTERM").short("K");
+    app.flag("watch", "redraw when the set of listening sockets changes").short("w");
+    app.flag("udp", "include bound UDP sockets, not just TCP listeners").short("u");
+    app.flag("json", "machine-readable output");
+    app.flag("full", "show the full command line, not just the program name");
+    app.flag("no-user", "omit the USER column");
+    app.intOption("interval", "watch refresh in milliseconds").dfltInt(500).meta("MS");
+    app.positional("port", "only this port").meta("PORT");
+    app.flag("version", "print the version and exit");
+
+    if (!app.parse(args())) {
+        print(app.report());
+        exit(app.exitCode());
+    }
+    if (app.helpWanted()) { print(app.usage()); return; }
+    if (app.on("version")) { print("port-watch " + VERSION); return; }
+
+    let portArg = app.get("port");
+    let port = -1;
+    if (!portArg.is_empty()) {
+        port = parsePort(portArg);
+        if (port < 0) {
+            print(`port-watch: "{portArg}" is not a port number (1-65535)`);
+            exit(2);
+        }
+    }
+
+    let sp = sysproc();
+
+    if (app.on("kill")) {
+        if (port < 0) {
+            print("port-watch: --kill needs a port, e.g. port-watch -k 3000");
+            exit(2);
+        }
+        exit(killPort(sp, port, app.on("force"), app.on("udp")));
+    }
+
+    if (app.on("watch")) {
+        watch(sp, app, port);
+        return;
+    }
+
+    let socks = collect(sp, app, port);
+    let un = attribute(sp, socks, app.on("full"));
+    sortSocks(socks);
+
+    if (app.on("json")) {
+        print(json(socks, un));
+        return;
+    }
+
+    if (socks.len == 0 && port >= 0) {
+        // Not an error: "nothing is listening" is a legitimate answer and the
+        // most common reason to run the tool. Exit 1 so a script can branch
+        // on it without parsing the text.
+        print(`nothing is listening on port {port}`);
+        exit(1);
+    }
+    print(table(socks, un, !app.on("no-user")));
+}
+
+fn parsePort(s: string): int {
+    if (s.is_empty() || s.len > 5) { return -1; }
+    let v = 0;
+    let i = 0;
+    while (i < s.len) {
+        let d = s[i] - 48;
+        if (d < 0 || d > 9) { return -1; }
+        v = v * 10 + d;
+        i += 1;
+    }
+    if (v < 1 || v > 65535) { return -1; }
+    return v;
+}
+
+fn collect(sp: Sysproc, app: Cli, port: int): Sock[] {
+    let all = listening(sp, app.on("udp"));
+    if (port < 0) { return all; }
+    let out: Sock[] = [];
+    let i = 0;
+    while (i < all.len) {
+        if (all[i].port == port) { out.push(all[i]); }
+        i += 1;
+    }
+    return out;
+}
+
+// ---- kill ---------------------------------------------------------------
+
+// Terminate whatever holds `port`. Returns a process exit code.
+//
+// The care here is deliberate: this is the one path that destroys something.
+// It refuses rather than guesses whenever the target is ambiguous or the
+// outcome cannot be confirmed.
+fn killPort(sp: Sysproc, port: int, force: bool, udp: bool): int {
+    let all = listening(sp, udp);
+    let hits: Sock[] = [];
+    let i = 0;
+    while (i < all.len) {
+        if (all[i].port == port) { hits.push(all[i]); }
+        i += 1;
+    }
+
+    if (hits.len == 0) {
+        print(`nothing is listening on port {port}`);
+        return 1;
+    }
+
+    let un = attribute(sp, hits, false);
+
+    // Distinct pids holding this port. Usually one; a pre-forking server
+    // shares its listening socket across workers and shows several, which is
+    // why this reads s.pids (every holder) and not s.pid (the first).
+    let pids: int[] = [];
+    let cmds: string[] = [];
+    i = 0;
+    while (i < hits.len) {
+        let s = hits[i];
+        i += 1;
+        let p = 0;
+        while (p < s.pids.len) {
+            let cand = s.pids[p];
+            let cmd = s.cmds[p];
+            p += 1;
+            let seen = false;
+            let k = 0;
+            while (k < pids.len) {
+                if (pids[k] == cand) { seen = true; break; }
+                k += 1;
+            }
+            if (!seen) { pids.push(cand); cmds.push(cmd); }
+        }
+    }
+
+    if (pids.len == 0) {
+        if (un.denied > 0) {
+            print(`port {port} is held by another user's process — run with sudo`);
+            return 1;
+        }
+        print(`port {port} has no owning process to kill`);
+        return 1;
+    }
+
+    // More than one holder is exactly the pre-fork case, where killing a
+    // worker accomplishes nothing because the supervisor respawns it. Refuse
+    // and name them rather than killing one at random.
+    if (pids.len > 1) {
+        print(`port {port} is held by {pids.len} processes:`);
+        let k = 0;
+        while (k < pids.len) {
+            print(`  {pids[k]}  {cmds[k]}`);
+            k += 1;
+        }
+        print("");
+        print("Refusing to guess which one to kill. This is usually a pre-forking");
+        print("server: killing a worker just makes the supervisor respawn it.");
+        print("Kill the supervisor by pid instead.");
+        return 1;
+    }
+
+    let pid = pids[0];
+    let cmd = cmds[0];
+
+    let sig = SIGTERM;
+    let signame = "SIGTERM";
+    if (force) { sig = SIGKILL; signame = "SIGKILL"; }
+
+    if ((kill(pid as i32, sig as i32) as int) != 0) {
+        // The only ordinary failure is permission: the process belongs to
+        // another user. ESRCH would mean it exited in the last millisecond,
+        // which is a success from the caller's point of view.
+        if (!aliveNow(pid)) {
+            print(`port {port} was released by {pid} ({cmd}) before the signal landed`);
+            return 0;
+        }
+        print(`port-watch: cannot signal {pid} ({cmd}) — not yours to kill; try sudo`);
+        return 1;
+    }
+
+    // Confirm rather than assume. A SIGTERM that a process ignores is the
+    // normal case for several databases, and reporting success there would
+    // be a lie the user only discovers when the port is still busy.
+    let waited = 0;
+    while (waited < 2000) {
+        usleep(50000 as culong);       // 50ms
+        waited += 50;
+        if (!aliveNow(pid)) {
+            print(`killed {pid} ({cmd}) — port {port} is free`);
+            return 0;
+        }
+    }
+
+    if (force) {
+        print(`port-watch: sent SIGKILL to {pid} ({cmd}), still alive after 2s`);
+        print("The process is probably stuck in uninterruptible I/O (state D).");
+        return 1;
+    }
+    print(`port-watch: {pid} ({cmd}) ignored {signame} after 2s — still holding port {port}`);
+    print(`Force it with: port-watch -k -K {port}`);
+    return 1;
+}
+
+// Liveness, via the process STATE rather than kill(pid, 0).
+//
+// A zombie answers kill(pid, 0) successfully — the pid is still allocated —
+// but it has already released every descriptor, so the port is free. Probing
+// with the signal would report a successful kill as "ignored the signal" for
+// any process whose parent has not yet reaped it, which is the normal case
+// when `-k` is run from a script.
+fn aliveNow(pid: int): bool {
+    return (pw_alive(pid as i32) as int) != 0;
+}
+
+// ---- watch --------------------------------------------------------------
+
+// Redraw when the set of sockets changes.
+//
+// Only on CHANGE, not on a timer: a table that reprints identically twice a
+// second is unreadable, and the thing being watched for is a port appearing
+// or disappearing. The signature is cheap to compute and captures exactly
+// that, so an unchanged machine costs one /proc/net read per interval and
+// no fd walk at all.
+fn watch(sp: Sysproc, app: Cli, port: int) {
+    let interval = app.getInt("interval");
+    if (interval < 50) { interval = 50; }
+    let showUser = !app.on("no-user");
+    let full = app.on("full");
+    let last = "";
+
+    while (true) {
+        let socks = collect(sp, app, port);
+        let sig = signature(socks);
+
+        if (sig != last) {
+            last = sig;
+            let un = attribute(sp, socks, full);
+            sortSocks(socks);
+            // Clear and home. No terminal detection — there is no isatty
+            // binding — so this is unconditional, the same choice vyto/cli
+            // makes about colour.
+            print(clearScreen() + table(socks, un, showUser));
+            // stdout is BLOCK-buffered when it is not a terminal, so a watch
+            // piped into anything else would emit nothing at all until the
+            // buffer filled or the process ended — and a watch is normally
+            // ended by a signal, which discards the buffer. Flushing each
+            // draw is what makes `port-watch -w | tee log` behave.
+            pw_flush();
+        }
+        usleep((interval * 1000) as culong);
+    }
+}
+
+// ESC [ 2 J  ESC [ H — erase the display, put the cursor home.
+//
+// Built from the byte rather than written as "\x1b[2J": a string literal here
+// would be fine, but the same text inside a BACKTICK TEMPLATE would not be —
+// templates do not process escapes — so the sequence lives in one named place
+// rather than being re-spelled at each use.
+fn clearScreen(): string {
+    let esc = bytes(1);
+    esc[0] = 27;
+    let e = str(esc as cstring);
+    return e + "[2J" + e + "[H";
+}
+
+// Port+proto+inode, which changes exactly when a socket appears, disappears,
+// or is replaced by a different socket on the same port — the last being a
+// restart, which is the event most worth seeing.
+fn signature(socks: Sock[]): string {
+    let parts: string[] = [];
+    let i = 0;
+    while (i < socks.len) {
+        let s = socks[i];
+        parts.push(`{s.port}/{s.proto}/{s.inode}`);
+        i += 1;
+    }
+    return parts.join(",");
+}

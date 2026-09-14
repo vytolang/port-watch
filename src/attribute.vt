@@ -1,0 +1,196 @@
+// Joining sockets to the processes that hold them.
+//
+// There is exactly one path from a port to a pid on Linux: /proc/net/* gives
+// a socket an INODE, and /proc/<pid>/fd/<n> is a symlink reading
+// "socket:[<inode>]". Nothing else connects the two, so this walk is not an
+// optimisation over some cheaper API — it is the only way.
+//
+// The walk is also the entire cost of the tool. A desktop has ~300 processes
+// holding a few thousand descriptors between them, and a naive implementation
+// readlink()s every one and builds a string per result: ~200ms, which makes
+// the watch mode feel broken.
+//
+// Two things keep it fast, both of which have to be done in this order:
+//
+//   1. The set of inodes we care about is known BEFORE the walk starts —
+//      it is exactly the listening sockets, typically a few dozen. It is
+//      sorted once and passed into the C side, which binary-searches it per
+//      descriptor and returns only matches. The thousands of pipes, files and
+//      connected sockets never cross the FFI boundary at all.
+//
+//   2. The walk stops early. Once every wanted inode has an owner there is
+//      nothing left to find, so the remaining processes are skipped. In the
+//      common case — one port, asked about by name — this visits a handful of
+//      processes instead of all of them.
+//
+// What is deliberately NOT done: caching pid->inode between refreshes. A
+// socket moving between processes is precisely the event the watch mode
+// exists to show, and a cache would hide it for one interval.
+
+import { Sysproc } from "port-watch/src/sysproc";
+import { Sock } from "port-watch/src/procnet";
+
+// How many sockets could not be attributed, and why. Reported in a footer
+// rather than as blank cells, because a blank owner reads as "nothing owns
+// this port", which is never true and sends people down the wrong path.
+export class Unresolved {
+    denied: int;      // /proc/<pid>/fd not ours to read: needs sudo
+    vanished: int;    // socket exists, no live process holds it
+
+    fn init() { this.denied = 0; this.vanished = 0; }
+
+    fn any(): bool { return this.denied > 0 || this.vanished > 0; }
+}
+
+fn isDigits(s: string): bool {
+    if (s.is_empty()) { return false; }
+    let i = 0;
+    while (i < s.len) {
+        let d = s[i] - 48;
+        if (d < 0 || d > 9) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn toInt(s: string): int {
+    let v = 0;
+    let i = 0;
+    while (i < s.len) { v = v * 10 + (s[i] - 48); i += 1; }
+    return v;
+}
+
+// Insertion sort over the inode set. It is a few dozen elements in every
+// realistic case, so this beats anything cleverer and keeps the file free of
+// a sort import.
+fn sortInodes(xs: i64[]) {
+    let i = 1;
+    while (i < xs.len) {
+        let v = xs[i];
+        let j = i - 1;
+        while (j >= 0 && xs[j] > v) {
+            xs[j + 1] = xs[j];
+            j -= 1;
+        }
+        xs[j + 1] = v;
+        i += 1;
+    }
+}
+
+// The command name for a pid: argv[0] with its arguments, falling back to
+// /proc/<pid>/comm.
+//
+// comm is truncated to 15 characters by the kernel, which turns
+// "postgres: writer" into "postgres" and loses exactly the part that
+// identifies which of eight identical processes this is. cmdline has the full
+// text, NUL-separated, but is empty for kernel threads — hence the fallback.
+fn commandOf(sp: Sysproc, pid: int, full: bool): string {
+    let cmd = sp.cmdline(pid, full).trim();
+    if (!cmd.is_empty()) {
+        if (!full) {
+            // Just the basename: /usr/lib/firefox/firefox -> firefox.
+            // Safe only because cmdline(pid, false) returned argv[0] ALONE —
+            // over a whole command line this would find a slash inside some
+            // later argument.
+            let slash = cmd.last_index_of("/");
+            if (slash >= 0 && slash + 1 < cmd.len) {
+                return cmd.slice(slash + 1, cmd.len);
+            }
+        }
+        return cmd;
+    }
+    let comm = sp.readFile(`/proc/{pid}/comm`, 256).trim();
+    if (comm.is_empty()) { return "?"; }
+    // Square brackets are the convention for a kernel thread, matching ps.
+    return `[{comm}]`;
+}
+
+// Attribute every socket in `socks` to a process, in place.
+//
+// Returns the tally of what could not be resolved.
+export fn attribute(sp: Sysproc, socks: Sock[], full: bool): Unresolved {
+    let un = new Unresolved();
+    if (socks.len == 0) { return un; }
+
+    // 1. The wanted set, sorted for the binary search on the C side.
+    let wanted: i64[] = [];
+    let i = 0;
+    while (i < socks.len) {
+        wanted.push(socks[i].inode as i64);
+        i += 1;
+    }
+    sortInodes(wanted);
+
+    // 2. Walk the processes.
+    //
+    // Every process, with no early exit once each socket has AN owner: one
+    // inode can be held by many processes (a pre-forking server shares its
+    // listening socket with every worker), so stopping at the first holder
+    // would under-report exactly the case where the count matters.
+    let entries = sp.listDir("/proc");
+    let deniedPids = 0;
+
+    let e = 0;
+    while (e < entries.len) {
+        let name = entries[e];
+        e += 1;
+        if (!isDigits(name)) { continue; }      // /proc has non-pid entries
+        let pid = toInt(name);
+
+        let ok: bool[] = [true];
+        let hits = sp.scanPid(pid, wanted, ok);
+
+        if (!ok[0]) {
+            // Could not open /proc/<pid>/fd. Either it exited between the
+            // listdir and now, or it belongs to another user. Only the second
+            // is worth telling the user about, and the uid of /proc/<pid>
+            // tells them apart without needing root.
+            let uid = sp.pathUid(`/proc/{pid}`);
+            if (uid >= 0 && uid != sp.selfUid) { deniedPids += 1; }
+            continue;
+        }
+        if (hits.len == 0) { continue; }
+
+        // Resolve the command once per process, not once per socket: a
+        // server with 40 listening sockets would otherwise re-read cmdline
+        // 40 times.
+        let cmd = "";
+        let h = 0;
+        while (h < hits.len) {
+            let ino = hits[h];
+            h += 1;
+            let k = 0;
+            while (k < socks.len) {
+                let s = socks[k];
+                k += 1;
+                if (s.inode != ino) { continue; }
+                if (cmd.is_empty()) { cmd = commandOf(sp, pid, full); }
+                if (s.pid < 0) {
+                    // First holder seen becomes the one shown in the table.
+                    s.pid = pid;
+                    s.cmd = cmd;
+                    s.user = sp.userName(s.uid);
+                }
+                s.pids.push(pid);
+                s.cmds.push(cmd);
+            }
+        }
+    }
+
+    // 3. Anything still unowned. A socket whose holder we were denied is
+    // reported as denied; one with no holder at all is genuinely ownerless
+    // (a TIME_WAIT remnant, or a socket held only by a kernel subsystem).
+    let u = 0;
+    while (u < socks.len) {
+        let s = socks[u];
+        u += 1;
+        if (s.pid >= 0) { continue; }
+        s.user = sp.userName(s.uid);
+        if (deniedPids > 0 && s.uid != sp.selfUid) {
+            un.denied += 1;
+        } else {
+            un.vanished += 1;
+        }
+    }
+    return un;
+}

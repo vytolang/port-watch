@@ -1,0 +1,146 @@
+// The /proc reads, wrapped so the rest of the program never touches FFI.
+//
+// Everything here goes through src/native/src/proc_shim.c rather than the
+// `readfile`/`listdir` builtins, for one reason: those builtins PANIC on a
+// path they cannot open (runtime/vyto_rt.c's vt_dir_list and readfile), and
+// under /proc that is routine. A process exits between being listed and being
+// read; another user's /proc/<pid>/fd is not ours to open. Aborting on either
+// would make the tool unusable for a non-root user, which is the main user.
+//
+// So every read here returns emptiness on failure, and the CALLER decides
+// whether emptiness is worth reporting. That distinction is the whole reason
+// this file exists.
+
+extern "C" {
+    fn pw_readlink(path: cstring, buf: cstring, cap: i32): i32;
+    fn pw_listdir(path: cstring, buf: cstring, cap: i32, trunc: rawptr): i32;
+    fn pw_readfile(path: cstring, buf: cstring, cap: i32): i32;
+    fn pw_cmdline(pid: i32, full: i32, buf: cstring, cap: i32): i32;
+    fn pw_path_uid(path: cstring): i32;
+    fn pw_username(uid: i32, buf: cstring, cap: i32): i32;
+    fn pw_self_uid(): i32;
+    fn pw_scan_pid_fds(pid: i32, wanted: rawptr, nwanted: i32,
+                       out: cstring, outcap: i32): i32;
+}
+
+// Buffers are reused across calls rather than allocated per read. A refresh
+// touches a few thousand /proc files, and one allocation each would be the
+// difference between a redraw that feels instant and one that does not — the
+// same reasoning as StringBuilder keeping its capacity across clear().
+export class Sysproc {
+    buf: byte[];
+    small: byte[];
+    userCache: string[];        // uid -> name, sparse, grown on demand
+    userCached: bool[];
+    selfUid: int;
+
+    fn init() {
+        this.buf = bytes(1 << 20);   // 1 MiB: /proc/net/tcp on a busy host
+        this.small = bytes(65536);
+        this.userCache = [];
+        this.userCached = [];
+        this.selfUid = pw_self_uid() as int;
+    }
+
+    // File contents, or "" if it could not be read for any reason.
+    fn readFile(path: string, cap: int): string {
+        let n = pw_readfile(path.cstr(), this.buf as cstring,
+                            this.buf.len as i32) as int;
+        if (n <= 0) { return ""; }
+        return str(this.buf as cstring);
+    }
+
+    // Directory entries. Empty array for both "cannot open" and "empty";
+    // use dirReadable() when the difference matters.
+    fn listDir(path: string): string[] {
+        let t = bytes(8);
+        let n = pw_listdir(path.cstr(), this.small as cstring,
+                           this.small.len as i32, t as rawptr) as int;
+        if (n <= 0) { return []; }
+        let s = str(this.small as cstring);
+        if (s.is_empty()) { return []; }
+        return s.split("\n");
+    }
+
+    fn dirReadable(path: string): bool {
+        let t = bytes(8);
+        return (pw_listdir(path.cstr(), this.small as cstring, 16 as i32,
+                           t as rawptr) as int) >= 0;
+    }
+
+    fn readLink(path: string): string {
+        let n = pw_readlink(path.cstr(), this.small as cstring,
+                            4096 as i32) as int;
+        if (n <= 0) { return ""; }
+        return str(this.small as cstring);
+    }
+
+    // argv[0], or the whole command line when `full`. Split on the C side
+    // because /proc/<pid>/cmdline is NUL-SEPARATED and those separators
+    // survive into the Vyto string, so argv[0] is not findable from here.
+    fn cmdline(pid: int, full: bool): string {
+        let f = 0;
+        if (full) { f = 1; }
+        let n = pw_cmdline(pid as i32, f as i32, this.small as cstring,
+                           this.small.len as i32) as int;
+        if (n <= 0) { return ""; }
+        return str(this.small as cstring);
+    }
+
+    fn pathUid(path: string): int { return pw_path_uid(path.cstr()) as int; }
+
+    // uid -> name, memoised. A table of 200 sockets owned by three users
+    // would otherwise be 200 getpwuid calls, each potentially hitting NSS
+    // and, on a misconfigured host, the network.
+    fn userName(uid: int): string {
+        if (uid < 0) { return "?"; }
+        while (this.userCached.len <= uid) {
+            this.userCached.push(false);
+            this.userCache.push("");
+        }
+        if (this.userCached[uid]) { return this.userCache[uid]; }
+        let b = bytes(256);
+        pw_username(uid as i32, b as cstring, 256 as i32);
+        let name = str(b as cstring);
+        this.userCache[uid] = name;
+        this.userCached[uid] = true;
+        return name;
+    }
+
+    // Socket inodes held by `pid` that appear in the sorted `wanted` set.
+    // Returns an empty array when /proc/<pid>/fd cannot be opened; `ok` is
+    // set false in that case so the caller can say "denied" rather than
+    // silently attributing the socket to nobody.
+    fn scanPid(pid: int, wanted: i64[], ok: bool[]): int[] {
+        let n = pw_scan_pid_fds(pid as i32, wanted as rawptr,
+                                wanted.len as i32,
+                                this.small as cstring,
+                                this.small.len as i32) as int;
+        if (n < 0) { ok[0] = false; return []; }
+        ok[0] = true;
+        if (n == 0) { return []; }
+        let text = str(this.small as cstring);
+        let out: int[] = [];
+        let lines = text.split("\n");
+        let i = 0;
+        while (i < lines.len) {
+            let ln = lines[i];
+            if (!ln.is_empty()) {
+                let v = 0;
+                let k = 0;
+                let good = true;
+                while (k < ln.len) {
+                    let d = ln[k] - 48;
+                    if (d < 0 || d > 9) { good = false; break; }
+                    v = v * 10 + d;
+                    k += 1;
+                }
+                if (good && v > 0) { out.push(v); }
+            }
+            i += 1;
+        }
+        return out;
+    }
+}
+
+export fn sysproc(): Sysproc { return new Sysproc(); }
