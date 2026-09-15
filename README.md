@@ -17,11 +17,11 @@ is installed. One binary, no runtime, nothing to configure.
   631  tcp        ?  root             127.0.0.1   ?
  3306  tcp        ?  mysql            127.0.0.1   ?
  5432  tcp        ?  postgres         127.0.0.1   ?
-14000  tcp6   19559  eric             *           pebble
-16347  tcp    52128  eric             127.0.0.1   code
-17601  tcp    35211  eric             *           vyto-proxyd
+ 3000  tcp    84213  jdoe             *           node
+ 8080  tcp6   84990  jdoe             *           java
+ 9229  tcp    84213  jdoe             127.0.0.1   node
 
-7 sockets owned by another user — run with sudo to resolve
+4 sockets owned by another user — run with sudo to resolve
 ```
 
 That is the unprivileged view: your own processes are named, other users' are
